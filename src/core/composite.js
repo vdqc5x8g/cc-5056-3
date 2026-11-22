@@ -1,132 +1,57 @@
 // Recomposition from estimated components onto a NEW background.
 //
-//   predicted(x) = T(x) * Bnew(x + d(x)) + A(x)
+// This module is the compatibility surface. The authoritative component
+// contract lives in `components.js`; a legacy per-pixel `model` is adapted at
+// this boundary so every existing caller keeps working unchanged, while new
+// callers can pass typed components directly.
 //
-// Every output pixel is computed from the estimated T/A fields and the new
-// background; no source image is ever copied in. Undetermined pixels are
-// reported as errors rather than silently made transparent.
+// External behaviour is frozen:
+//   * predicted(x) = T(x) * Bnew(x + d(x)) + A(x)
+//   * outside the selection the new background passes through unchanged,
+//   * degenerate pixels are NaN and listed in `unresolved` (never transparent),
+//   * no source image is ever copied in.
 
-import { STATUS } from './solver.js';
 import { LinearImage } from './image.js';
+import {
+  Region,
+  asComponents,
+  compositeComponents,
+  componentImagesFromComponents,
+  reconstructComponents,
+} from './components.js';
 
-export function composite(model, newBg, opts = {}) {
-  const { width, height } = model;
-  const out = new LinearImage(width, height);
-  const residualMask = new Uint8Array(width * height);
-  const useOffset = opts.useOffset ?? model.includeOffset;
-  const unresolved = [];
-  const bg = [0, 0, 0];
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const i = y * width + x;
-      const st = model.status[i];
-      if (st === STATUS.OUTSIDE) {
-        // Outside the selected transmission region: show the new background
-        // unchanged (the product is not present there).
-        newBg.sampleBilinear(x, y, 0, 0, bg);
-        out.setPixel(x, y, bg[0], bg[1], bg[2]);
-        continue;
-      }
-      if (st === STATUS.UNDETERMINED || st === STATUS.NO_SOLUTION) {
-        residualMask[i] = 1;
-        unresolved.push(i);
-        out.setPixel(x, y, Number.NaN, Number.NaN, Number.NaN);
-        continue;
-      }
-      const dx = useOffset ? model.offset[i * 2] : 0;
-      const dy = useOffset ? model.offset[i * 2 + 1] : 0;
-      newBg.sampleBilinear(x, y, dx, dy, bg);
-      const r = model.T[i * 3] * bg[0] + model.A[i * 3];
-      const g = model.T[i * 3 + 1] * bg[1] + model.A[i * 3 + 1];
-      const b = model.T[i * 3 + 2] * bg[2] + model.A[i * 3 + 2];
-      out.setPixel(x, y, r, g, b);
-    }
+// The new background must match the component grid; silently sampling a
+// differently-sized plate would invent coordinates the model never declared.
+function assertBackgroundSize(width, height, newBg) {
+  if (newBg.width !== width || newBg.height !== height) {
+    throw new Error(
+      `background is ${newBg.width}x${newBg.height}, expected ${width}x${height}; refusing to assume a coordinate grid`
+    );
   }
-  return { image: out, unresolved, unresolvedMask: residualMask };
 }
 
-// Re-render the fitted observations (for residual diagnostics). This is
-// reconstruction from the model, not a copy of the source.
-export function reconstruct(model, observations, sampleBgForObs, width, height) {
-  const nObs = observations.length;
-  const recon = observations.map(() => new LinearImage(width, height));
-  const mask = new Uint8Array(width * height);
-  const bg = [0, 0, 0];
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const i = y * width + x;
-      if (model.status[i] === STATUS.OUTSIDE) {
-        for (let k = 0; k < nObs; k++) {
-          observations[k].getPixel(x, y, bg);
-          recon[k].setPixel(x, y, bg[0], bg[1], bg[2]);
-        }
-        continue;
-      }
-      if (model.status[i] === STATUS.UNDETERMINED) {
-        mask[i] = 1;
-        for (let k = 0; k < nObs; k++) recon[k].setPixel(x, y, Number.NaN, Number.NaN, Number.NaN);
-        continue;
-      }
-      for (let k = 0; k < nObs; k++) {
-        sampleBgForObs(k, x, y, bg);
-        const T = model.T;
-        const A = model.A;
-        recon[k].setPixel(
-          x,
-          y,
-          T[i * 3] * bg[0] + A[i * 3],
-          T[i * 3 + 1] * bg[1] + A[i * 3 + 1],
-          T[i * 3 + 2] * bg[2] + A[i * 3 + 2]
-        );
-      }
-    }
-  }
-  return { recon, undeterminedMask: mask };
+export function composite(modelOrComponents, newBg, opts = {}) {
+  const components = asComponents(modelOrComponents);
+  if (!newBg) throw new Error('composite: a new background image is required');
+  assertBackgroundSize(components.width, components.height, newBg);
+  return compositeComponents(components, newBg, opts);
 }
 
 // Component visualisations. Each returns an image in linear space:
 //   transmission  -> T tint on mid-grey, so 1.0 reads as neutral grey
 //   reflection    -> A as emitted colour on black
 //   backgroundTerm-> T * Bnew on black (the background contribution)
-export function componentImages(model, newBg, opts = {}) {
-  const { width, height } = model;
-  const tint = new LinearImage(width, height);
-  const reflection = new LinearImage(width, height);
-  const backgroundTerm = new LinearImage(width, height);
-  const useOffset = opts.useOffset ?? model.includeOffset;
-  const bg = [0, 0, 0];
-  for (let i = 0, n = width * height; i < n; i++) {
-    const x = i % width;
-    const y = (i / width) | 0;
-    const st = model.status[i];
-    if (st === STATUS.OUTSIDE) {
-      for (let c = 0; c < 3; c++) {
-        tint.data[i * 3 + c] = 0.18;
-        reflection.data[i * 3 + c] = 0;
-        backgroundTerm.data[i * 3 + c] = 0;
-      }
-      continue;
-    }
-    if (st === STATUS.UNDETERMINED || st === STATUS.NO_SOLUTION) {
-      for (let c = 0; c < 3; c++) {
-        // Magenta sentinel = "model does not know here".
-        tint.data[i * 3 + c] = c === 1 ? 0 : 0.35;
-        reflection.data[i * 3 + c] = 0;
-        backgroundTerm.data[i * 3 + c] = 0;
-      }
-      continue;
-    }
-    const dx = useOffset ? model.offset[i * 2] : 0;
-    const dy = useOffset ? model.offset[i * 2 + 1] : 0;
-    newBg.sampleBilinear(x, y, dx, dy, bg);
-    for (let c = 0; c < 3; c++) {
-      const T = model.T[i * 3 + c];
-      tint.data[i * 3 + c] = 0.18 * T + 0.5 * (1 - T); // T=1 -> 0.18, T=0 -> 0.5
-      reflection.data[i * 3 + c] = model.A[i * 3 + c];
-      backgroundTerm.data[i * 3 + c] = T * bg[c];
-    }
-  }
-  return { tint, reflection, backgroundTerm };
+export function componentImages(modelOrComponents, newBg, opts = {}) {
+  const components = asComponents(modelOrComponents);
+  if (!newBg) throw new Error('componentImages: a new background image is required');
+  assertBackgroundSize(components.width, components.height, newBg);
+  return componentImagesFromComponents(components, newBg, opts);
+}
+
+// Re-render the fitted observations (for residual diagnostics). This is
+// reconstruction from the model, not a copy of the source.
+export function reconstruct(modelOrComponents, observations, sampleBgForObs, width, height) {
+  return reconstructComponents(asComponents(modelOrComponents), observations, sampleBgForObs, width, height);
 }
 
 // Residual between two linear images over a mask, per channel + luma.
@@ -191,3 +116,5 @@ export function referenceFromFields(T, A, offset, mask, newBg, width, height, us
   }
   return out;
 }
+
+export { Region };

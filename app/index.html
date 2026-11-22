@@ -64,6 +64,10 @@
         Each component is shown on its own. Magenta = the model cannot separate it (undetermined),
         not "transparent".
       </p>
+      <div class="legend" id="region-legend">
+        <span><i style="background:#2c5a57"></i>identifiable</span>
+        <span><i style="background:#ff5bd0"></i>degenerate (unknown, never defaulted)</span>
+      </div>
       <div class="component-grid">
         <figure>
           <canvas id="c-transmission" width="192" height="192"></canvas>
@@ -135,6 +139,14 @@
         <p class="muted" id="compare-note">
           Load a sample scene to compare against a ground-truth composite.
         </p>
+      </div>
+      <div class="stats-block">
+        <h3>Composite run status</h3>
+        <div id="composite-status" class="run-status idle">
+          <span class="status-dot"></span>
+          <span id="composite-status-text" class="muted">Not estimated yet.</span>
+        </div>
+        <div id="composite-anomalies" class="anomaly-list"></div>
       </div>
     </section>
   </main>

@@ -16,6 +16,7 @@
 
 import { STATUS, solveImage, pooledScore, makeModel } from './solver.js';
 import { maskedNccShift, exposureAndDrift } from './align.js';
+import { Region, makeComponents } from './components.js';
 
 function ringMask(width, height, mask, margin) {
   // Background-only ring: pixels near but outside the glass selection.
@@ -320,8 +321,63 @@ export function estimateScene({ observations, backgrounds, mask, width, height, 
       'curvature, caustics, dispersion or polarisation; a single alpha/transparency cannot reproduce arbitrary glass.',
   });
 
+  // --- typed component representation -------------------------------------
+  // The solver's per-pixel status is the authority on what is known. Convert
+  // it once, here, into the frozen component contract. The legacy `model` is
+  // kept as the old entry; `components` is what new callers should consume.
+  //
+  // The integrity check is deliberate: a pixel marked identifiable must carry
+  // finite T/A, and a degenerate pixel must carry none. If the solver ever
+  // drifted from that contract, compositing would otherwise be free to
+  // substitute a default — which is exactly what the interface forbids.
+  const nPixels = width * height;
+  const region = new Uint8Array(nPixels);
+  for (let i = 0; i < nPixels; i++) {
+    const st = model.status[i];
+    if (st === STATUS.OUTSIDE) region[i] = Region.OUTSIDE;
+    else if (st === STATUS.OK || st === STATUS.CLAMPED) {
+      region[i] = Region.IDENTIFIABLE;
+      for (let c = 0; c < 3; c++) {
+        if (!Number.isFinite(model.T[i * 3 + c]) || !Number.isFinite(model.A[i * 3 + c])) {
+          throw new Error(
+            `estimateScene: pixel ${i} is ${STATUS[st]} but T/A are non-finite; refusing to emit a defaulted component`
+          );
+        }
+      }
+    } else {
+      region[i] = Region.DEGENERATE;
+      for (let c = 0; c < 3; c++) {
+        if (!Number.isNaN(model.T[i * 3 + c]) || !Number.isNaN(model.A[i * 3 + c])) {
+          throw new Error(
+            `estimateScene: degenerate pixel ${i} carries finite T/A; unknown components must not be defaulted`
+          );
+        }
+      }
+    }
+  }
+  const components = makeComponents({
+    width,
+    height,
+    T: model.T,
+    A: model.A,
+    offset: model.offset,
+    region,
+    channelRegion: null,
+    includeOffset,
+    source: 'estimated',
+    legacyStatus: model.status,
+  });
+  diagnostics.componentCounts = {
+    outside: components.counts.outside,
+    identifiable: components.counts.identifiable,
+    degenerate: components.counts.degenerate,
+  };
+
   return {
+    // Legacy entry (old callers): per-pixel model with status codes.
     model,
+    // Typed component entry (refactored callers): frozen T/A/region contract.
+    components,
     shifts,
     exposures,
     checks,

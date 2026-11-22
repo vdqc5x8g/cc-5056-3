@@ -8,8 +8,13 @@
 // Commands:
 //   synth    [--scene basic|threeway|degenerate|refraction|drifting|all] [--out DIR]
 //   estimate --obs A.png,B.png --bg A0.png,B0.png --mask M.png [--out DIR]
-//            [--newbg N.png] [--offset]
+//            [--newbg N.png] [--ref reference.png] [--offset]
 //   check    --obs ... --bg ... --mask M.png
+//   compare  --pred composite.png --ref reference.png [--mask M.png]
+//
+// `estimate` consumes the typed component contract (src/core/components.js),
+// not the legacy per-pixel model, and reports component reconstruction RMS,
+// composite residual (when --ref is given) and composite anomaly counts.
 //
 // All pixels are read as sRGB 8-bit and processed in linear light.
 
@@ -17,14 +22,14 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { PNG } from 'pngjs';
 import { LinearImage } from '../src/core/image.js';
-import { estimateScene, STATUS } from '../src/core/pipeline.js';
+import { estimateScene } from '../src/core/pipeline.js';
 import {
   composite,
   componentImages,
   reconstruct,
-  referenceFromFields,
   residualStats,
 } from '../src/core/composite.js';
+import { Region, GLASS_COMPONENT_SPEC } from '../src/core/components.js';
 import { generateScene, listScenes, truthFieldsPayload } from '../src/core/scenes.js';
 import { makeBackground } from '../src/core/synth.js';
 
@@ -173,20 +178,21 @@ async function estimate(args) {
   const outDir = join(args.out || 'out/estimate');
   await mkdir(outDir, { recursive: true });
   const newBg = args.newbg ? await readPng(args.newbg) : makeBackground('dots', inputs.width, inputs.height, 99);
-  const comps = componentImages(result.model, newBg, { useOffset: !!args.offset });
+  // New callers consume the typed component contract. The legacy `result.model`
+  // is still accepted by the same functions, but we do not rely on it here.
+  const components = result.components;
+  const comps = componentImages(components, newBg, { useOffset: !!args.offset });
   await writePng(join(outDir, 'transmission.png'), comps.tint);
   await writePng(join(outDir, 'reflection.png'), comps.reflection);
   await writePng(join(outDir, 'background_term.png'), comps.backgroundTerm);
-  const comp = composite(result.model, newBg, { useOffset: !!args.offset });
-  await writePng(join(outDir, 'composite.png'), comp.image);
+  const comp = composite(components, newBg, { useOffset: !!args.offset });  await writePng(join(outDir, 'composite.png'), comp.image);
 
   // Validity mask: white where the model resolved a value, black where it left
   // the pixel undetermined (those are written as black in composite.png and
   // must not be scored as if they were predictions).
   const valid = new LinearImage(inputs.width, inputs.height);
   for (let i = 0; i < inputs.width * inputs.height; i++) {
-    const st = result.model.status[i];
-    const v = st === STATUS.OK || st === STATUS.CLAMPED ? 1 : 0;
+    const v = components.region[i] === Region.IDENTIFIABLE ? 1 : 0;
     valid.data[i * 3] = valid.data[i * 3 + 1] = valid.data[i * 3 + 2] = v;
   }
   await writePng(join(outDir, 'resolved_mask.png'), valid);
@@ -205,9 +211,39 @@ async function estimate(args) {
     }
     result.normalize.normBg[k].sampleBilinear(x, y, dx, dy, out);
   };
-  const { recon } = reconstruct(result.model, result.normalize.normObs, sampleBg, inputs.width, inputs.height);
+  const { recon } = reconstruct(components, result.normalize.normObs, sampleBg, inputs.width, inputs.height);
   for (let k = 0; k < recon.length; k++) {
     await writePng(join(outDir, `recon_${k + 1}.png`), recon[k]);
+  }
+
+  // Component reconstruction evidence and composite residual, over identifiable
+  // pixels only. Degenerate pixels are unknown, so they are excluded rather
+  // than scored as if the model made a prediction there.
+  const identifiableMask = new Uint8Array(inputs.width * inputs.height);
+  for (let i = 0; i < identifiableMask.length; i++) {
+    identifiableMask[i] = components.region[i] === Region.IDENTIFIABLE ? 1 : 0;
+  }
+  const reconRms = recon.map((img, k) =>
+    residualStats(img, result.normalize.normObs[k], inputs.width, inputs.height, identifiableMask).rms
+  );
+  // Composite residual is only computed when a reference is supplied. Without
+  // one there is nothing to be residual *against*, and reporting zero would be
+  // a default masquerading as evidence.
+  let compositeResidual = null;
+  if (args.ref) {
+    const ref = await readPng(args.ref);
+    if (ref.width !== inputs.width || ref.height !== inputs.height) {
+      throw new Error(`reference size mismatch: ${ref.width}x${ref.height} vs ${inputs.width}x${inputs.height}`);
+    }
+    const stats = residualStats(comp.image, ref, inputs.width, inputs.height, identifiableMask);
+    compositeResidual = {
+      reference: args.ref,
+      rms: stats.rms,
+      maxAbs: stats.maxAbs,
+      perChannelRms: stats.perChannelRms,
+      pixels: stats.pixels,
+      note: 'scored over identifiable pixels only; degenerate pixels are unknown, not zero',
+    };
   }
 
   const rms = result.diagnostics.perObservationResidualRms.map((v) => fmt(v)).join(', ');
@@ -218,6 +254,11 @@ async function estimate(args) {
         warnings: result.warnings,
         checks: result.checks,
         diagnostics: result.diagnostics,
+        componentSpec: GLASS_COMPONENT_SPEC,
+        componentCounts: components.counts,
+        componentReconstructionRms: reconRms,
+        compositeResidual,
+        anomalyCounts: comp.anomalies.counts,
         unresolvedPixels: comp.unresolved.length,
         compositeNote:
           'composite.png is recomputed from estimated T, A and the new background; it is not a crop of any observation.',
@@ -231,6 +272,18 @@ async function estimate(args) {
   );
   console.log(`wrote ${outDir}/ (composite, components, reconstructions, resolved_mask.png, report.json)`);
   console.log(`reconstruction RMS per shot: ${rms}`);
+  if (compositeResidual) {
+    console.log(
+      `composite residual vs reference: rms=${fmt(compositeResidual.rms)} ` +
+        `max=${fmt(compositeResidual.maxAbs)} over ${compositeResidual.pixels} identifiable px`
+    );
+  }
+  const ac = comp.anomalies.counts;
+  console.log(
+    `composite anomalies: unknown=${ac.unknown} bg-range=${ac.backgroundOutOfRange} ` +
+      `product-range=${ac.productOutOfRange} composite-range=${ac.compositeOutOfRange} ` +
+      `reflection-dominated=${ac.reflectionDominated}`
+  );
 }
 
 async function check(args) {
@@ -281,7 +334,7 @@ http://localhost:5173/ (see docs/GLASS_COMPOSITING.md).
 
 Commands:
   synth     [--scene NAME|all] [--out DIR]
-  estimate  --obs A.png,B.png --bg A0.png,B0.png --mask M.png [--newbg N.png] [--offset] [--out DIR]
+  estimate  --obs A.png,B.png --bg A0.png,B0.png --mask M.png [--newbg N.png] [--ref reference.png] [--offset] [--out DIR]
   check     --obs ... --bg ... --mask M.png [--offset]
   compare   --pred composite.png --ref reference.png [--mask M.png]
 

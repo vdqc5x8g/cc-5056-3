@@ -6,9 +6,9 @@
 
 import { LinearImage } from '/src/core/image.js';
 import { makeBackground } from '/src/core/synth.js';
-import { estimateScene, STATUS } from '/src/core/pipeline.js';
+import { estimateScene } from '/src/core/pipeline.js';
 import { composite, componentImages, reconstruct, residualStats, referenceFromFields } from '/src/core/composite.js';
-import { maskedNccShift } from '/src/core/align.js';
+import { Region, Anomaly } from '/src/core/components.js';
 
 const state = {
   scene: null, // loaded scene spec with PNG data
@@ -316,6 +316,9 @@ function clearEstimatePanels() {
   $('warnings').innerHTML = '';
   $('resolved-bar').style.width = '0%';
   $('resolved-text').textContent = '—';
+  $('composite-status').className = 'run-status idle';
+  $('composite-status-text').textContent = 'Not estimated yet.';
+  $('composite-anomalies').innerHTML = '';
 }
 
 // ---------------------------------------------------------------------------
@@ -473,8 +476,8 @@ function showWarnings(result) {
 }
 
 function showComponents(result) {
-  const { model } = result;
-  const comps = componentImages(model, state.newBg, { useOffset: state.useOffset });
+  const components = result.components;
+  const comps = componentImages(components, state.newBg, { useOffset: state.useOffset });
   drawLinear($('c-transmission'), comps.tint);
   drawLinear($('c-reflection'), comps.reflection);
   drawLinear($('c-bgterm'), comps.backgroundTerm);
@@ -493,7 +496,7 @@ function showComponents(result) {
     result.normalize.normBg[k].sampleBilinear(x, y, dx, dy, out);
   };
   const { recon } = reconstruct(
-    model,
+    components,
     result.normalize.normObs,
     sampleBgForObs,
     state.width,
@@ -509,8 +512,8 @@ function showIdentifiability(result) {
   $('resolved-text').textContent = `${pct.toFixed(1)}% of selection identifiable`;
   const rows = [
     ['Selected pixels', d.selectedPixels],
-    ['Resolved (interior/clamped)', d.resolvedPixels],
-    ['Undetermined', d.undeterminedPixels],
+    ['Resolved (identifiable)', d.resolvedPixels],
+    ['Degenerate (unknown)', d.undeterminedPixels],
     ['Mean background spread', d.meanBackgroundSpread.toFixed(4)],
     ['Mean residual RMS', d.meanResidualRms.toFixed(4)],
   ];
@@ -524,8 +527,10 @@ function showIdentifiability(result) {
 }
 
 function showComposite(result) {
-  const comp = composite(result.model, state.newBg, { useOffset: state.useOffset });
+  const components = result.components;
+  const comp = composite(components, state.newBg, { useOffset: state.useOffset });
   drawLinear($('composite-canvas'), comp.image);
+  showCompositeStatus(comp);
 
   // Compare against ground-truth reference where the model resolved.
   const compareKv = $('compare-kv');
@@ -536,12 +541,11 @@ function showComposite(result) {
     return;
   }
   const resolvedMask = new Uint8Array(state.width * state.height);
-  let resolvedCount = 0;
   let undetermined = 0;
   for (let i = 0; i < state.width * state.height; i++) {
-    const st = result.model.status[i];
-    if (st === STATUS.OK || st === STATUS.CLAMPED) { resolvedMask[i] = 1; resolvedCount++; }
-    if (st === STATUS.UNDETERMINED || st === STATUS.NO_SOLUTION) undetermined++;
+    const rg = components.region[i];
+    if (rg === Region.IDENTIFIABLE) resolvedMask[i] = 1;
+    else if (rg === Region.DEGENERATE) undetermined++;
   }
   const stats = residualStats(comp.image, state.reference, state.width, state.height, resolvedMask);
   const fmtNum = (v) => (Number.isFinite(v) ? v.toFixed(4) : 'n/a');
@@ -562,6 +566,46 @@ function showComposite(result) {
       'A low residual means the declared model fits this held-out background. It does NOT prove the ' +
       'real material parameters are uniquely known; see the warnings for what the model cannot represent.';
   }
+}
+
+// Composite run status plus the two things a transparent product makes easy to
+// confuse: its own additive reflection, and the background transmitted through
+// it. The counts come straight from the typed-component compositor, so a
+// degenerate region is reported as unknown rather than as a contribution.
+//
+// Severity is reserved for values that left the display range (out-of-range
+// contributions or clipping). A degenerate region and reflection-dominant
+// pixels are expected conditions of the declared model, so they are surfaced
+// as warnings/notes rather than dressed up as errors.
+function showCompositeStatus(comp) {
+  const statusEl = $('composite-status');
+  const textEl = $('composite-status-text');
+  const listEl = $('composite-anomalies');
+  const counts = comp.anomalies.counts;
+
+  const outOfRange = counts.backgroundOutOfRange + counts.productOutOfRange + counts.compositeOutOfRange;
+  let level = 'ok';
+  if (counts.unknown > 0) level = 'warn';
+  if (outOfRange > 0) level = 'bad';
+  statusEl.className = `run-status ${level}`;
+  const label =
+    level === 'ok' ? 'Composite computed from typed components.'
+      : level === 'bad' ? 'Composite computed; contributions out of display range.'
+        : 'Composite computed; degenerate area left unknown.';
+  textEl.textContent = `${label} ${counts.unknown} unknown px · ${outOfRange} out-of-range px`;
+
+  const rows = [
+    ['unknown region (no contribution, not transparent)', counts.unknown, counts.unknown > 0 ? 'warn' : 'zero'],
+    ['background contribution out of range', counts.backgroundOutOfRange, counts.backgroundOutOfRange > 0 ? 'hot' : 'zero'],
+    ['product reflection out of range', counts.productOutOfRange, counts.productOutOfRange > 0 ? 'hot' : 'zero'],
+    ['composite clipping [0,1]', counts.compositeOutOfRange, counts.compositeOutOfRange > 0 ? 'hot' : 'zero'],
+    ['reflection exceeds transmitted background', counts.reflectionDominated, counts.reflectionDominated > 0 ? 'note' : 'zero'],
+  ];
+  listEl.innerHTML = rows
+    .map(([label, n, cls]) =>
+      `<div class="anomaly-item ${cls}"><span>${escapeHtml(label)}</span><span class="n">${n} px</span></div>`
+    )
+    .join('');
 }
 
 function fmtTriple(a) {
@@ -657,4 +701,4 @@ init().catch((err) => {
 });
 
 // Expose a few internals for debugging in the console (not used by the UI).
-window.__glassLab = { state, estimateScene, composite };
+window.__glassLab = { state, estimateScene, composite, Region, Anomaly };
