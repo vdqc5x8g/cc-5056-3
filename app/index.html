@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Glass Compositing Lab</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <strong>Glass Compositing Lab</strong>
+      <span class="sub">transmission · chromatic attenuation · additive reflection</span>
+    </div>
+    <nav class="toolbar">
+      <label class="field">
+        <span>Sample scene</span>
+        <select id="scene-select"></select>
+      </label>
+      <button id="load-scene" class="primary">Load scene</button>
+      <span class="sep"></span>
+      <label class="field">
+        <span>Backgrounds</span>
+        <span id="obs-count" class="pill">0</span>
+      </label>
+      <button id="estimate" class="primary" disabled>Estimate components</button>
+    </nav>
+  </header>
+
+  <main class="layout">
+    <!-- LEFT: observations + selection -->
+    <section class="panel left">
+      <h2>1 · Observations &amp; selection</h2>
+      <p class="hint">
+        Paint the <em>transmission region</em> (the clear body of the product).
+        The same fixed object must appear in every shot; the tool checks that before estimating.
+      </p>
+      <div class="canvas-wrap">
+        <canvas id="obs-canvas" width="384" height="384"></canvas>
+        <div class="overlay-tools">
+          <button id="brush-mode" class="chip active" title="Paint selection">Paint</button>
+          <button id="erase-mode" class="chip" title="Erase selection">Erase</button>
+          <label class="field small">
+            <span>Brush</span>
+            <input id="brush-size" type="range" min="4" max="48" value="18" />
+          </label>
+          <button id="clear-mask" class="chip">Clear</button>
+          <button id="fill-mask" class="chip">Fill body</button>
+        </div>
+        <div id="obs-tabs" class="tabs"></div>
+      </div>
+
+      <div class="checklist" id="checks">
+        <h3>Consistency checks</h3>
+        <p class="muted">Load a scene to run alignment and exposure checks.</p>
+      </div>
+    </section>
+
+    <!-- CENTER: components + residuals -->
+    <section class="panel center">
+      <h2>2 · Estimated components</h2>
+      <p class="hint">
+        Each component is shown on its own. Magenta = the model cannot separate it (undetermined),
+        not "transparent".
+      </p>
+      <div class="component-grid">
+        <figure>
+          <canvas id="c-transmission" width="192" height="192"></canvas>
+          <figcaption>Transmission <code>T</code><br /><small>chromatic attenuation, 1.0 = neutral</small></figcaption>
+        </figure>
+        <figure>
+          <canvas id="c-reflection" width="192" height="192"></canvas>
+          <figcaption>Additive reflection <code>A</code><br /><small>background-independent</small></figcaption>
+        </figure>
+        <figure>
+          <canvas id="c-bgterm" width="192" height="192"></canvas>
+          <figcaption>Background term <code>T·B_new</code><br /><small>transmitted background contribution</small></figcaption>
+        </figure>
+        <figure>
+          <canvas id="c-residual" width="192" height="192"></canvas>
+          <figcaption>Reconstruction residual<br /><small>model vs. each observation</small></figcaption>
+        </figure>
+      </div>
+
+      <div class="stats-block">
+        <h3>Identifiability</h3>
+        <div class="meter-row">
+          <div class="meter"><div id="resolved-bar" style="width:0%"></div></div>
+          <span id="resolved-text" class="muted">—</span>
+        </div>
+        <dl class="kv" id="ident-kv"></dl>
+      </div>
+      <div class="warnings" id="warnings"></div>
+    </section>
+
+    <!-- RIGHT: composite onto new background -->
+    <section class="panel right">
+      <h2>3 · Composite onto a new background</h2>
+      <p class="hint">
+        The result is recomputed from <code>T</code>, <code>A</code> and this <em>new</em> background.
+        The original photo is never pasted through.
+      </p>
+      <div class="controls">
+        <label class="field">
+          <span>New background</span>
+          <select id="newbg-select">
+            <option value="dots">dots</option>
+            <option value="checker">checker</option>
+            <option value="gradient">gradient</option>
+            <option value="stripes">stripes</option>
+            <option value="spectrum">spectrum</option>
+            <option value="flat-light">flat light</option>
+            <option value="flat-dark">flat dark</option>
+          </select>
+        </label>
+        <label class="field check">
+          <input type="checkbox" id="use-offset" />
+          <span>Include background coordinate offset</span>
+        </label>
+      </div>
+      <div class="composite-row">
+        <figure>
+          <canvas id="composite-canvas" width="256" height="256"></canvas>
+          <figcaption>Composited product</figcaption>
+        </figure>
+        <figure>
+          <canvas id="reference-canvas" width="256" height="256"></canvas>
+          <figcaption>Reference (ground truth)</figcaption>
+        </figure>
+      </div>
+      <div class="compare" id="compare">
+        <h3>Prediction vs. reference</h3>
+        <dl class="kv" id="compare-kv"></dl>
+        <p class="muted" id="compare-note">
+          Load a sample scene to compare against a ground-truth composite.
+        </p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>
+      This tool estimates a <strong>declared</strong> model. A low residual does not prove unique
+      real-material parameters; unsupported optical effects are reported, not hidden.
+    </span>
+  </footer>
+
+  <script type="module" src="/main.js"></script>
+</body>
+</html>

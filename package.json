@@ -1,0 +1,20 @@
+{
+  "name": "glass-compositing-lab",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Transparent-product compositing lab: separate transmission, chromatic attenuation and additive reflection from observations over known backgrounds, then composite onto a new background with explicit model limits.",
+  "scripts": {
+    "ui": "node tools/serve.js",
+    "synth": "node tools/glass-cli.js synth --scene all",
+    "estimate": "node tools/glass-cli.js estimate",
+    "test": "node --test test/*.test.js",
+    "check": "node tools/glass-cli.js check"
+  },
+  "dependencies": {
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "puppeteer": "^25.18.1"
+  }
+}
